@@ -1,0 +1,29 @@
+name = "purdue-photography-club-email"
+main = "src/index.ts"
+compatibility_date = "2026-06-21"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = false
+
+[observability]
+enabled = true
+head_sampling_rate = 0.1
+
+[[services]]
+binding = "API_WORKER"
+service = "purdue-photography-club-api"
+
+[[kv_namespaces]]
+binding = "RECEIPT_DEDUPE"
+id = "00000000000000000000000000000000"
+
+[[ratelimits]]
+name = "EMAIL_WORKER_RATE_LIMITER"
+namespace_id = "1003"
+
+  [ratelimits.simple]
+  limit = 10
+  period = 60
+
+[vars]
+RECEIPT_TO_ADDRESS = "purchases@purduephotoclub.org"
+RECEIPT_DEDUPE_TTL_SECONDS = "34560000"

@@ -1,0 +1,9 @@
+interface Env {
+  ALLOWED_FORWARDERS: string;
+  API_WORKER: Fetcher;
+  EMAIL_WORKER_RATE_LIMITER?: RateLimit;
+  INTERNAL_TOKEN: string;
+  RECEIPT_DEDUPE: KVNamespace;
+  RECEIPT_DEDUPE_TTL_SECONDS?: string;
+  RECEIPT_TO_ADDRESS?: string;
+}

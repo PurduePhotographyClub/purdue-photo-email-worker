@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: verify
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      - name: React Doctor
+        run: npm run doctor
+
+      - name: Dependency audit
+        run: npm audit --audit-level=high
+
+      - name: Secret pattern scan
+        shell: bash
+        run: |
+          if grep -RInE "(sk-[A-Za-z0-9_-]{20,}|ghp_[A-Za-z0-9_]{20,}|-----BEGIN (RSA|OPENSSH|EC|PRIVATE) KEY-----)" . --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=dist --exclude-dir=.wrangler --exclude=package-lock.json --exclude='.env*' --exclude='.dev.vars*'; then
+            echo "Potential committed secret material found."
+            exit 1
+          fi

@@ -8,6 +8,9 @@ workers_dev = false
 enabled = true
 head_sampling_rate = 0.1
 
+[limits]
+cpu_ms = 150
+
 [[services]]
 binding = "API_WORKER"
 service = "purdue-photography-club-api"

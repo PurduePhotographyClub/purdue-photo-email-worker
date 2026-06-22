@@ -14,7 +14,7 @@ service = "purdue-photography-club-api"
 
 [[kv_namespaces]]
 binding = "RECEIPT_DEDUPE"
-id = "00000000000000000000000000000000"
+id = "65523a4936e640a2b2adcc665244d51b"
 
 [[ratelimits]]
 name = "EMAIL_WORKER_RATE_LIMITER"

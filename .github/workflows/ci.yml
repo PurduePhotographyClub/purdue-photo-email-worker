@@ -25,7 +25,7 @@ jobs:
           cache: npm
 
       - name: Install
-        run: npm ci
+        run: npm ci --ignore-scripts
 
       - name: Typecheck
         run: npm run typecheck
@@ -47,6 +47,14 @@ jobs:
             exit 1
           fi
 
+      - name: Upload deploy artifact
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: email-worker-dist
+          path: dist
+          if-no-files-found: error
+
   deploy:
     name: deploy
     runs-on: ubuntu-latest
@@ -56,9 +64,6 @@ jobs:
     concurrency:
       group: email-worker-production
       cancel-in-progress: false
-    env:
-      CLOUDFLARE_ACCOUNT_ID: 63a413648250a48c6caa17e9963f5ee1
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -67,14 +72,18 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
 
-      - name: Install
-        run: npm ci
+      - name: Download deploy artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: email-worker-dist
+          path: dist
 
       - name: Check Cloudflare deploy token
         id: cloudflare-token
         shell: bash
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: |
           if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
             echo "available=false" >> "$GITHUB_OUTPUT"
@@ -85,4 +94,7 @@ jobs:
 
       - name: Deploy
         if: steps.cloudflare-token.outputs.available == 'true'
-        run: npm run deploy
+        env:
+          CLOUDFLARE_ACCOUNT_ID: 63a413648250a48c6caa17e9963f5ee1
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: npx --yes wrangler@4.103.0 deploy dist/index.js --no-bundle --config wrangler.toml

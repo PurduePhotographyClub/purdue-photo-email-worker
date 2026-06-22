@@ -72,5 +72,17 @@ jobs:
       - name: Install
         run: npm ci
 
+      - name: Check Cloudflare deploy token
+        id: cloudflare-token
+        shell: bash
+        run: |
+          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::CLOUDFLARE_API_TOKEN is not set; skipping Cloudflare deployment."
+          else
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Deploy
+        if: steps.cloudflare-token.outputs.available == 'true'
         run: npm run deploy

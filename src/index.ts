@@ -87,7 +87,10 @@ export function buildReceiptPayloads(receipt: TooCoolReceipt): ReceiptPayload[] 
   }
 
   return receipt.lineItems.flatMap((item) => {
-    if (!item.kind) {
+    if (
+      !item.kind ||
+      !isFulfillableReceiptLineItem(item.quantity, item.totalCents)
+    ) {
       return [];
     }
 
@@ -473,14 +476,18 @@ function readStackedLineItems(lines: string[]): TooCoolLineItem[] {
       continue;
     }
 
+    const quantity = Number(lines[index]);
     const description = normalizeDescription(tail.slice(0, firstMoneyIndex).join(" "));
     const totalCents = moneyToCents(moneyValues[3]);
+    if (!isFulfillableReceiptLineItem(quantity, totalCents)) {
+      continue;
+    }
     const classification = classifyLineItem(description, totalCents);
     items.push({
       amount: formatMoney(totalCents),
       description,
       kind: classification.kind,
-      quantity: Number(lines[index]),
+      quantity,
       tier: classification.tier,
       totalCents,
     });
@@ -508,6 +515,9 @@ function parseLineItem(line: string): TooCoolLineItem | null {
   const quantity = Number(match[1]);
   const description = normalizeDescription(match[2]);
   const totalCents = moneyToCents(match[6]);
+  if (!isFulfillableReceiptLineItem(quantity, totalCents)) {
+    return null;
+  }
   const classification = classifyLineItem(description, totalCents);
 
   return {
@@ -573,6 +583,15 @@ function slugify(value: string) {
 function moneyToCents(value: string) {
   const [dollars = "0", cents = "0"] = value.split(".");
   return (Number(dollars) * 100) + Number(cents.padEnd(2, "0").slice(0, 2));
+}
+
+function isFulfillableReceiptLineItem(quantity: number, totalCents: number) {
+  return (
+    Number.isInteger(quantity) &&
+    quantity >= 1 &&
+    Number.isSafeInteger(totalCents) &&
+    totalCents > 0
+  );
 }
 
 function isMoney(value: string) {

@@ -4,6 +4,9 @@ compatibility_date = "2026-06-21"
 compatibility_flags = ["nodejs_compat"]
 workers_dev = false
 
+[triggers]
+crons = ["*/5 * * * *"]
+
 [observability]
 enabled = true
 head_sampling_rate = 0.1
@@ -30,3 +33,4 @@ namespace_id = "1003"
 [vars]
 RECEIPT_TO_ADDRESS = "purchases@purduephotoclub.org"
 RECEIPT_DEDUPE_TTL_SECONDS = "34560000"
+RECEIPT_RETRY_TTL_SECONDS = "2592000"

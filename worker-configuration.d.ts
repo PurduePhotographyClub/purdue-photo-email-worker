@@ -5,5 +5,6 @@ interface Env {
   INTERNAL_TOKEN: string;
   RECEIPT_DEDUPE: KVNamespace;
   RECEIPT_DEDUPE_TTL_SECONDS?: string;
+  RECEIPT_RETRY_TTL_SECONDS?: string;
   RECEIPT_TO_ADDRESS?: string;
 }

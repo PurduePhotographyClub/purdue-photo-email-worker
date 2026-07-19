@@ -22,7 +22,7 @@
     "unpdf": "^1.6.2"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20260621.1",
+    "@cloudflare/workers-types": "^5.20260719.1",
     "typescript": "^6.0.3",
     "wrangler": "^4.95.0"
   }

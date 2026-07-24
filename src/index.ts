@@ -1,5 +1,6 @@
 import { buildReceiptPayloads, parseTooCoolReceiptText } from "./receipt-parser.ts";
 import type { ReceiptPayload } from "./receipt-parser.ts";
+import type { Address, Email as ParsedEmail } from "postal-mime";
 export { buildReceiptPayloads, parseTooCoolReceiptText } from "./receipt-parser.ts";
 export type { ReceiptPayload, TooCoolReceipt } from "./receipt-parser.ts";
 
@@ -7,12 +8,18 @@ const INTERNAL_SOURCE_HEADER = "x-pcc-internal-source";
 const INTERNAL_TOKEN_HEADER = "x-internal-token";
 const EMAIL_WORKER_SOURCE = "email-worker";
 const API_RECEIPT_PATH = "/internal/receipts";
+const API_RECEIPT_CONFIG_PATH = "/internal/receipts/config";
 const DEFAULT_RECEIPT_TO_ADDRESS = "purchases@purduephotoclub.org";
 const DEFAULT_DEDUPE_TTL_SECONDS = 400 * 24 * 60 * 60;
 const DEFAULT_RETRY_TTL_SECONDS = 30 * 24 * 60 * 60;
+const RECEIPT_INGRESS_CONFIG_CACHE_KEY = "receipt-ingress-config:v1";
+const RECEIPT_INGRESS_CONFIG_CACHE_TTL_SECONDS = 15 * 60;
+const MAX_RECEIPT_INGRESS_CONFIG_CACHE_BYTES = 2_048;
+const MAX_RECEIPT_INGRESS_CONFIG_RESPONSE_BYTES = 4_096;
 const RECEIPT_PROCESSING_LEASE_SECONDS = 5 * 60;
 const RECEIPT_RETRY_BASE_SECONDS = 5 * 60;
 const RECEIPT_RETRY_MAX_SECONDS = 24 * 60 * 60;
+const RECEIPT_RETRY_MAX_ATTEMPTS = 5;
 const MAX_RAW_EMAIL_BYTES = 10 * 1024 * 1024;
 const MAX_PDF_BYTES = 4 * 1024 * 1024;
 const MAX_FULFILLMENT_PAYLOADS_PER_EMAIL = 50;
@@ -37,13 +44,17 @@ interface ReceiptQueueRecord {
 
 interface AttachmentLike {
   content?: ArrayBuffer | Uint8Array | string;
-  contentType?: string;
-  filename?: string;
+  filename?: string | null;
   mimeType?: string;
 }
 
-interface ParsedMimeLike {
-  attachments?: AttachmentLike[];
+interface ReceiptIngressConfig {
+  allowedSenderEmail: string;
+  receiptToAddress: string;
+}
+
+interface CachedReceiptIngressConfig extends ReceiptIngressConfig {
+  cachedAt: number;
 }
 
 export async function processReceiptPayload(
@@ -51,10 +62,7 @@ export async function processReceiptPayload(
   payload: ReceiptPayload,
   nowIso = new Date().toISOString(),
 ): Promise<ReceiptProcessResult> {
-  const token = env.INTERNAL_TOKEN?.trim();
-  if (!token) {
-    throw new Error("INTERNAL_TOKEN is required for email-worker-to-API calls.");
-  }
+  const token = readEmailWorkerInternalToken(env);
   if (!env.API_WORKER) {
     throw new Error("API_WORKER service binding is required for receipt fulfillment.");
   }
@@ -138,6 +146,11 @@ export async function processReceiptPayload(
     existing.nextAttemptAt &&
     existing.nextAttemptAt > nowIso
   ) {
+    await putReceiptQueueRecord(env, retryKey, {
+      ...existing,
+      payload,
+      payloadFingerprint,
+    });
     return { duplicate: false, queued: true, status: 202 };
   }
 
@@ -172,6 +185,7 @@ export async function processReceiptPayload(
     await queueReceiptRetry(
       env,
       retryKey,
+      failedKey,
       payload,
       payloadFingerprint,
       existing,
@@ -204,6 +218,7 @@ export async function processReceiptPayload(
     await queueReceiptRetry(
       env,
       retryKey,
+      failedKey,
       payload,
       payloadFingerprint,
       existing,
@@ -275,6 +290,7 @@ export async function retryQueuedReceiptPayloads(
 ) {
   let cursor: string | undefined;
   let failed = 0;
+  let ingressConfig: ReceiptIngressConfig | null = null;
   let retried = 0;
   let scanned = 0;
   let succeeded = 0;
@@ -285,12 +301,27 @@ export async function retryQueuedReceiptPayloads(
       prefix: "receipt-retry:",
     });
     scanned += page.keys.length;
+    if (page.keys.length > 0 && !ingressConfig) {
+      ingressConfig = await getReceiptIngressConfig(env);
+    }
 
     for (const key of page.keys) {
       const record = readReceiptQueueRecord(
         await env.RECEIPT_DEDUPE.get(key.name),
       );
-      if (!record?.payload || !isReceiptQueueRecordDue(record, nowIso)) {
+      if (!record?.payload || !ingressConfig) {
+        continue;
+      }
+      if (record.payload.sourceSender !== ingressConfig.allowedSenderEmail) {
+        failed += 1;
+        await deadLetterQueuedReceiptForSender(
+          env,
+          key.name,
+          record,
+        );
+        continue;
+      }
+      if (!isReceiptQueueRecordDue(record, nowIso)) {
         continue;
       }
 
@@ -320,9 +351,9 @@ export async function retryQueuedReceiptPayloads(
 export async function extractPdfText(pdfBytes: ArrayBuffer): Promise<string> {
   const { extractText } = await import("unpdf");
   const result = await extractText(new Uint8Array(pdfBytes), {
-    mergePages: true,
+    mergePages: false,
   });
-  return result.text;
+  return result.text.join("\n");
 }
 
 async function handleReceiptEmail(
@@ -330,14 +361,17 @@ async function handleReceiptEmail(
   env: Env,
 ): Promise<void> {
   const destination = normalizeEmail(message.to);
-  if (destination !== getReceiptToAddress(env)) {
+  if (destination !== DEFAULT_RECEIPT_TO_ADDRESS) {
     message.setReject("Unexpected receipt mailbox.");
     return;
   }
 
-  if (!isAuthorizedForwarder(message.from, env.ALLOWED_FORWARDERS)) {
-    message.setReject("Unauthorized receipt sender.");
-    return;
+  if (
+    !Number.isSafeInteger(message.rawSize) ||
+    message.rawSize < 0 ||
+    message.rawSize > MAX_RAW_EMAIL_BYTES
+  ) {
+    throw new Error("Receipt email is too large.");
   }
 
   const rateLimitResponse = await checkEmailRateLimit(message, env);
@@ -346,8 +380,19 @@ async function handleReceiptEmail(
     return;
   }
 
+  const ingressConfig = await getReceiptIngressConfig(env);
+  const sourceSender = normalizeEmail(message.from);
+  if (sourceSender !== ingressConfig.allowedSenderEmail) {
+    message.setReject("Unauthorized receipt sender.");
+    return;
+  }
+
   const rawEmail = await readStreamWithLimit(message.raw, MAX_RAW_EMAIL_BYTES);
   const parsedEmail = await parseMime(rawEmail);
+  if (!(await hasMatchingFromHeader(parsedEmail, sourceSender))) {
+    message.setReject("Receipt From header does not match sender.");
+    return;
+  }
   const pdfAttachments = findPdfAttachments(parsedEmail);
   if (pdfAttachments.length === 0) {
     message.setReject("Receipt PDF attachment required.");
@@ -358,13 +403,19 @@ async function handleReceiptEmail(
     return;
   }
 
-  let payloadGroups: readonly (readonly ReceiptPayload[])[] = [];
-  for (const attachment of pdfAttachments) {
-    payloadGroups = [
-      ...payloadGroups,
-      await readReceiptAttachmentPayloads(attachment),
-    ];
-  }
+  const sourceMessageId = normalizeSourceMessageId(
+    message.headers.get("message-id"),
+  );
+  const payloadGroups = await Promise.all(
+    pdfAttachments.map(async (attachment) => {
+      const payloads = await readReceiptAttachmentPayloads(attachment);
+      return payloads.map((payload) => ({
+        ...payload,
+        ...(sourceMessageId ? { sourceMessageId } : {}),
+        sourceSender,
+      }));
+    }),
+  );
   const processedCount = await processReceiptPayloadGroups(env, payloadGroups);
 
   if (processedCount === 0) {
@@ -382,14 +433,42 @@ async function readReceiptAttachmentPayloads(attachment: AttachmentLike) {
   return buildReceiptPayloads(parseTooCoolReceiptText(text));
 }
 
-async function parseMime(rawEmail: ArrayBuffer): Promise<ParsedMimeLike> {
+async function parseMime(rawEmail: ArrayBuffer): Promise<ParsedEmail> {
   const PostalMime = (await import("postal-mime")).default;
-  return await new PostalMime().parse(rawEmail) as ParsedMimeLike;
+  return await new PostalMime().parse(rawEmail);
 }
 
-function findPdfAttachments(parsedEmail: ParsedMimeLike): AttachmentLike[] {
+async function hasMatchingFromHeader(
+  parsedEmail: ParsedEmail,
+  expectedSender: string,
+) {
+  const fromHeaders = parsedEmail.headers.filter(
+    (header) => header.key.toLowerCase() === "from",
+  );
+  if (fromHeaders.length !== 1) {
+    return false;
+  }
+
+  const { addressParser } = await import("postal-mime");
+  const addresses = addressParser(fromHeaders[0]?.value ?? "");
+  if (addresses.length !== 1) {
+    return false;
+  }
+
+  return readMailboxAddress(addresses[0]) === expectedSender &&
+    readMailboxAddress(parsedEmail.from) === expectedSender;
+}
+
+function readMailboxAddress(address: Address | undefined) {
+  if (!address || typeof address.address !== "string") {
+    return null;
+  }
+  return normalizeExactSenderEmail(address.address);
+}
+
+function findPdfAttachments(parsedEmail: ParsedEmail): AttachmentLike[] {
   return (parsedEmail.attachments ?? []).filter((attachment) => {
-    const contentType = (attachment.mimeType ?? attachment.contentType ?? "").toLowerCase();
+    const contentType = (attachment.mimeType ?? "").toLowerCase();
     const filename = (attachment.filename ?? "").toLowerCase();
     return contentType === "application/pdf" || filename.endsWith(".pdf");
   });
@@ -416,6 +495,198 @@ function copyToArrayBuffer(bytes: Uint8Array) {
   return copy.buffer;
 }
 
+async function getReceiptIngressConfig(
+  env: Env,
+): Promise<ReceiptIngressConfig> {
+  const token = readEmailWorkerInternalToken(env);
+  if (!env.API_WORKER) {
+    throw new Error("API_WORKER service binding is required for receipt ingestion.");
+  }
+  if (!env.RECEIPT_DEDUPE) {
+    throw new Error("RECEIPT_DEDUPE KV binding is required for receipt ingestion.");
+  }
+
+  let response: Response;
+  try {
+    response = await env.API_WORKER.fetch(
+      new Request(new URL(API_RECEIPT_CONFIG_PATH, "https://api.internal"), {
+        headers: {
+          accept: "application/json",
+          [INTERNAL_SOURCE_HEADER]: EMAIL_WORKER_SOURCE,
+          [INTERNAL_TOKEN_HEADER]: token,
+        },
+        method: "GET",
+      }),
+    );
+  } catch (error) {
+    return await readCachedReceiptIngressConfig(env, error);
+  }
+  if (!response.ok) {
+    if (response.status === 429 || response.status >= 500) {
+      return await readCachedReceiptIngressConfig(
+        env,
+        new Error(
+          `Receipt ingress configuration returned HTTP ${response.status}.`,
+        ),
+      );
+    }
+    throw new Error(
+      `Receipt ingress configuration returned HTTP ${response.status}.`,
+    );
+  }
+
+  const body = await readReceiptIngressConfigResponse(response);
+  if (!isRecord(body) || !isRecord(body.settings)) {
+    throw new Error("Receipt ingress configuration is invalid.");
+  }
+
+  const receiptToAddress = normalizeEmailValue(
+    body.settings.receiptToAddress,
+  );
+  if (receiptToAddress !== DEFAULT_RECEIPT_TO_ADDRESS) {
+    throw new Error("Receipt mailbox configuration is invalid.");
+  }
+
+  const configuredSender = body.settings.allowedSenderEmail;
+  if (typeof configuredSender !== "string") {
+    throw new Error("Receipt sender configuration is invalid.");
+  }
+  const allowedSenderEmail = normalizeExactSenderEmail(
+    configuredSender,
+  );
+  if (!allowedSenderEmail) {
+    throw new Error("Receipt sender configuration is invalid.");
+  }
+
+  const config = {
+    allowedSenderEmail,
+    receiptToAddress,
+  };
+  await cacheReceiptIngressConfig(env, config);
+  return config;
+}
+
+async function cacheReceiptIngressConfig(
+  env: Env,
+  config: ReceiptIngressConfig,
+) {
+  const cachedConfig: CachedReceiptIngressConfig = {
+    allowedSenderEmail: config.allowedSenderEmail,
+    cachedAt: Date.now(),
+    receiptToAddress: DEFAULT_RECEIPT_TO_ADDRESS,
+  };
+  try {
+    await env.RECEIPT_DEDUPE.put(
+      RECEIPT_INGRESS_CONFIG_CACHE_KEY,
+      JSON.stringify(cachedConfig),
+      { expirationTtl: RECEIPT_INGRESS_CONFIG_CACHE_TTL_SECONDS },
+    );
+  } catch (error) {
+    console.error("Could not refresh the receipt ingress configuration cache.", {
+      error: error instanceof Error ? error.message : "Unknown KV error.",
+    });
+  }
+}
+
+async function readReceiptIngressConfigResponse(
+  response: Response,
+): Promise<unknown> {
+  if (!response.body) {
+    throw new Error("Receipt ingress configuration is invalid.");
+  }
+
+  const bytes = await readStreamWithLimit(
+    response.body,
+    MAX_RECEIPT_INGRESS_CONFIG_RESPONSE_BYTES,
+    "Receipt ingress configuration is invalid.",
+  );
+  try {
+    return JSON.parse(new TextDecoder().decode(bytes)) as unknown;
+  } catch {
+    throw new Error("Receipt ingress configuration is invalid.");
+  }
+}
+
+async function readCachedReceiptIngressConfig(
+  env: Env,
+  liveError: unknown,
+): Promise<ReceiptIngressConfig> {
+  let value: string | null;
+  try {
+    value = await env.RECEIPT_DEDUPE.get(
+      RECEIPT_INGRESS_CONFIG_CACHE_KEY,
+    );
+  } catch {
+    throw normalizeError(liveError);
+  }
+  if (
+    !value ||
+    new TextEncoder().encode(value).byteLength >
+      MAX_RECEIPT_INGRESS_CONFIG_CACHE_BYTES
+  ) {
+    throw normalizeError(liveError);
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value) as unknown;
+  } catch {
+    throw normalizeError(liveError);
+  }
+  if (!isRecord(parsed)) {
+    throw normalizeError(liveError);
+  }
+
+  const keys = Object.keys(parsed).sort();
+  const expectedKeys = [
+    "allowedSenderEmail",
+    "cachedAt",
+    "receiptToAddress",
+  ];
+  const allowedSenderEmail = typeof parsed.allowedSenderEmail === "string"
+    ? parsed.allowedSenderEmail
+    : "";
+  const cachedAt = parsed.cachedAt;
+  const now = Date.now();
+  if (
+    keys.length !== expectedKeys.length ||
+    keys.some((key, index) => key !== expectedKeys[index]) ||
+    normalizeExactSenderEmail(allowedSenderEmail) !== allowedSenderEmail ||
+    parsed.receiptToAddress !== DEFAULT_RECEIPT_TO_ADDRESS ||
+    typeof cachedAt !== "number" ||
+    !Number.isSafeInteger(cachedAt) ||
+    cachedAt <= 0 ||
+    cachedAt > now ||
+    now - cachedAt > RECEIPT_INGRESS_CONFIG_CACHE_TTL_SECONDS * 1_000
+  ) {
+    throw normalizeError(liveError);
+  }
+
+  console.warn("Using recent cached receipt ingress configuration.", {
+    cacheAgeSeconds: Math.floor((now - cachedAt) / 1_000),
+  });
+  return {
+    allowedSenderEmail,
+    receiptToAddress: DEFAULT_RECEIPT_TO_ADDRESS,
+  };
+}
+
+function normalizeError(value: unknown) {
+  return value instanceof Error
+    ? value
+    : new Error("Receipt ingress configuration is unavailable.");
+}
+
+function readEmailWorkerInternalToken(env: Env) {
+  const token = env.EMAIL_WORKER_INTERNAL_TOKEN?.trim();
+  if (!token) {
+    throw new Error(
+      "EMAIL_WORKER_INTERNAL_TOKEN is required for email-worker-to-API calls.",
+    );
+  }
+  return token;
+}
+
 function readDedupeTtl(env: Env) {
   const parsed = Number(env.RECEIPT_DEDUPE_TTL_SECONDS);
   return Number.isFinite(parsed) && parsed > 0
@@ -436,6 +707,7 @@ async function putReceiptQueueRecord(
 async function queueReceiptRetry(
   env: Env,
   key: string,
+  failedKey: string,
   payload: ReceiptPayload,
   payloadFingerprint: string,
   existing: ReceiptQueueRecord | null,
@@ -443,6 +715,28 @@ async function queueReceiptRetry(
   error: unknown,
 ) {
   const attempts = Math.max(0, existing?.attempts ?? 0) + 1;
+  const errorMessage = error instanceof Error
+    ? error.message
+    : "Unknown receipt fulfillment error.";
+  if (attempts >= RECEIPT_RETRY_MAX_ATTEMPTS) {
+    await putReceiptQueueRecord(env, failedKey, {
+      attempts,
+      error: errorMessage,
+      payload,
+      payloadFingerprint,
+      status: "failed",
+    });
+    await env.RECEIPT_DEDUPE.delete(key);
+    console.error("Receipt fulfillment exhausted its retry budget.", {
+      attempts,
+      error: errorMessage,
+      idempotencyKey: payload.idempotencyKey,
+    });
+    throw new Error(
+      `Receipt fulfillment exhausted after ${attempts} attempts: ${errorMessage}`,
+    );
+  }
+
   const delaySeconds = Math.min(
     RECEIPT_RETRY_BASE_SECONDS * (2 ** Math.max(0, attempts - 1)),
     RECEIPT_RETRY_MAX_SECONDS,
@@ -460,9 +754,34 @@ async function queueReceiptRetry(
   });
   console.error("Receipt fulfillment queued for retry.", {
     attempts,
-    error: error instanceof Error ? error.message : "Unknown receipt fulfillment error.",
+    error: errorMessage,
     idempotencyKey: payload.idempotencyKey,
     nextAttemptAt,
+  });
+}
+
+async function deadLetterQueuedReceiptForSender(
+  env: Env,
+  retryKey: string,
+  record: ReceiptQueueRecord,
+) {
+  if (!record.payload) {
+    return;
+  }
+
+  const failedKey = `receipt-failed:${record.payload.idempotencyKey}`;
+  const payloadFingerprint = record.payloadFingerprint
+    ?? await createReceiptPayloadFingerprint(record.payload);
+  await putReceiptQueueRecord(env, failedKey, {
+    attempts: Math.max(0, record.attempts),
+    error: "Queued receipt sender is missing or no longer authorized.",
+    payload: record.payload,
+    payloadFingerprint,
+    status: "failed",
+  });
+  await env.RECEIPT_DEDUPE.delete(retryKey);
+  console.error("Queued receipt was dead-lettered after sender policy changed.", {
+    idempotencyKey: record.payload.idempotencyKey,
   });
 }
 
@@ -527,6 +846,21 @@ function isReceiptPayload(value: unknown): value is ReceiptPayload {
     typeof candidate.orderId === "string" &&
     typeof candidate.productName === "string" &&
     typeof candidate.purchasedAt === "string" &&
+    (
+      candidate.sourceMessageId === undefined ||
+      (
+        typeof candidate.sourceMessageId === "string" &&
+        candidate.sourceMessageId.length <= 255
+      )
+    ) &&
+    (
+      candidate.sourceSender === undefined ||
+      (
+        typeof candidate.sourceSender === "string" &&
+        normalizeExactSenderEmail(candidate.sourceSender) ===
+          candidate.sourceSender
+      )
+    ) &&
     (candidate.tier === undefined || candidate.tier === "member" || candidate.tier === "facilities")
   );
 }
@@ -545,7 +879,11 @@ function isReceiptQueueRecordDue(record: ReceiptQueueRecord, nowIso: string) {
 }
 
 function isPermanentReceiptApiFailure(status: number) {
-  return status === 400 || status === 409 || status === 422;
+  return (
+    status === 400 ||
+    status === 409 ||
+    status === 422
+  );
 }
 
 function areReceiptPayloadsEqual(left: ReceiptPayload, right: ReceiptPayload) {
@@ -648,6 +986,7 @@ async function readResponseBody(response: Response): Promise<unknown> {
 async function readStreamWithLimit(
   stream: ReadableStream<Uint8Array>,
   byteLimit: number,
+  tooLargeMessage = "Receipt email is too large.",
 ): Promise<ArrayBuffer> {
   const reader = stream.getReader();
   const chunks: Uint8Array[] = [];
@@ -660,7 +999,8 @@ async function readStreamWithLimit(
     }
     total += value.byteLength;
     if (total > byteLimit) {
-      throw new Error("Receipt email is too large.");
+      await reader.cancel().catch(() => undefined);
+      throw new Error(tooLargeMessage);
     }
     chunks.push(value);
   }
@@ -674,39 +1014,34 @@ async function readStreamWithLimit(
   return merged.buffer;
 }
 
-function getReceiptToAddress(env: Env) {
-  return normalizeEmail(env.RECEIPT_TO_ADDRESS || DEFAULT_RECEIPT_TO_ADDRESS);
-}
-
-function isAuthorizedForwarder(sender: string, allowlist: string | undefined) {
-  const normalizedSender = normalizeEmail(sender);
-  const rules = readForwarderRules(allowlist);
-
-  if (rules.length === 0) {
-    return false;
-  }
-
-  return rules.some((rule) => {
-    if (rule.startsWith("*@")) {
-      return normalizedSender.endsWith(rule.slice(1));
-    }
-    return normalizedSender === normalizeEmail(rule);
-  });
-}
-
-function readForwarderRules(allowlist: string | undefined) {
-  const rules: string[] = [];
-  for (const rawRule of (allowlist || "").split(",")) {
-    const rule = rawRule.trim().toLowerCase();
-    if (rule) {
-      rules.push(rule);
-    }
-  }
-  return rules;
-}
-
 function normalizeEmail(value: string | undefined) {
   return (value || "").trim().toLowerCase();
+}
+
+function normalizeEmailValue(value: unknown) {
+  return typeof value === "string" ? normalizeEmail(value) : "";
+}
+
+function normalizeExactSenderEmail(value: string | undefined) {
+  const normalized = normalizeEmail(value);
+  if (
+    normalized.length > 254 ||
+    normalized.includes(",") ||
+    normalized.includes("*") ||
+    !/^[^\s<>@]+@[^\s<>@]+\.[^\s<>@]+$/.test(normalized)
+  ) {
+    return null;
+  }
+  return normalized;
+}
+
+function normalizeSourceMessageId(value: string | null) {
+  const normalized = value?.replace(/\s+/g, " ").trim() ?? "";
+  return normalized ? normalized.slice(0, 255) : null;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 async function checkEmailRateLimit(message: ForwardableEmailMessage, env: Env) {

@@ -34,6 +34,8 @@ export interface ReceiptPayload {
   orderId: string;
   productName: string;
   purchasedAt: string;
+  sourceMessageId?: string;
+  sourceSender?: string;
   tier?: MembershipTier;
 }
 

@@ -43,7 +43,7 @@ sequenceDiagram
 | Film rolls | Builds a merchandise-style receipt payload | Posts Discord notification |
 | Prints | Builds a merchandise-style receipt payload | Posts Discord notification |
 
-The worker protects both ingress and fulfillment with idempotency. It reserves a key before calling the API, deletes the reservation if the API rejects the payload, and marks the key complete after success.
+The worker protects both ingress and fulfillment with idempotency. It reserves a key before calling the API, retains retryable failures for bounded delivery attempts, and marks the key complete after success.
 
 ## Tech Stack
 
@@ -63,7 +63,7 @@ npm install
 npm run dev
 ```
 
-Runtime secrets, sender allowlists, and routing settings are managed outside this public repository.
+Runtime secrets and Email Routing rules are managed outside this public repository. The dashboard must provide the single exact receipt sender; an empty, wildcard, or multi-address setting fails closed. The Worker fetches this policy for every email and may use a validated last-known-good KV copy for no more than 15 minutes only when the API is unreachable, rate limited, or returning a 5xx response. Authentication, route, and invalid-config responses always fail closed. Both configuration and fulfillment calls use the dedicated `EMAIL_WORKER_INTERNAL_TOKEN` secret; the shared API token is never accepted as a fallback.
 
 ## Verification
 
@@ -87,10 +87,12 @@ wrangler.toml                Worker metadata and non-secret bindings
 ## Operational Notes
 
 - Reject unexpected recipients before parsing.
-- Reject unauthorized senders before reading attachments.
+- Require the envelope sender and the single parsed RFC 5322 `From` mailbox to match the configured sender exactly.
 - Limit raw email and PDF sizes to protect Worker memory.
 - Parse only supported TooCOOL receipt lines.
 - Keep fulfillment idempotent across both KV and the API database.
+- Retry transport, 401, 403, 404, rate-limit, and server failures with exponential backoff for at most five total attempts; move exhausted items to `receipt-failed:` while 400, 409, and 422 responses dead-letter immediately.
+- Re-check the current sender policy once per scheduled retry sweep and dead-letter queued receipts from missing or revoked senders without calling the fulfillment API.
 - Deploy the API before this Worker because fulfillment is owned by the API.
 
 ## Assets And Licensing

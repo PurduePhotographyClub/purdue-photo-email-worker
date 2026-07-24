@@ -313,10 +313,6 @@ function readLineItems(lines: string[]): TooCoolLineItem[] {
   const items: TooCoolLineItem[] = [];
   if (headerIndex >= 0) {
     for (const line of lines.slice(headerIndex + 1)) {
-      if (/^\(\d+\)|^PAID\b|^Shipping\b|^Sales Tax\b|^Thank you\b|^Generated\b/i.test(line)) {
-        break;
-      }
-
       const item = parseLineItem(line);
       if (item) {
         items.push(item);

@@ -354,6 +354,50 @@ test("multi-quantity basic memberships use unit pricing and member-tier keys", (
   ]);
 });
 
+test("parses TooCOOL column-ordered text when footer copy precedes the item row", () => {
+  const payloads = buildReceiptPayloads(parseTooCoolReceiptText([
+    "Order",
+    "Page 1 of 1",
+    "Order:",
+    "Order Date:",
+    "Customer ID:",
+    "Ship To:",
+    "Quantity Description Color Size Unit Price Shipping Sales Tax Price",
+    "Thank you for using TooCOOL. Generated 1/17/2026 10:56:34 AM",
+    "Items",
+    "Shipping",
+    "Sales Tax",
+    "Total",
+    "143954",
+    "17 Jan 2026",
+    "griff329",
+    "Alejandro Steven",
+    "Alejandro Steven Griffith",
+    "7337 Fredericks Dr E",
+    "Indianapolis, IN 46260",
+    "United States Of America",
+    "1 Membership Dues S26 10.00 0.00 0.00 10.00",
+    "(01760) PHOTOGRAPHY CLUB",
+    "PAID 10.00",
+    "0.00",
+    "0.00",
+    "10.00",
+  ].join("\n")));
+
+  assert.deepEqual(payloads, [{
+    amount: "$10.00",
+    customerEmail: "griff329@purdue.edu",
+    customerName: "Alejandro Steven Griffith",
+    idempotencyKey:
+      "toocool:143954:membership:membership-dues-s26:1000",
+    kind: "membership",
+    orderId: "143954",
+    productName: "Membership Dues S26",
+    purchasedAt: "2026-01-17T00:00:00.000Z",
+    tier: "member",
+  }]);
+});
+
 test("rejects parsed receipt lines with an invalid quantity or total before classification", () => {
   assert.throws(
     () => parseTooCoolReceiptText(

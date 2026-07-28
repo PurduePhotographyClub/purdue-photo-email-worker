@@ -9,6 +9,7 @@ on:
       - completed
 
 permissions:
+  actions: write
   contents: write
   pull-requests: write
 
@@ -25,6 +26,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          CI_WORKFLOW_ID: ${{ github.event.workflow_run.workflow_id }}
           PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
           REPOSITORY: ${{ github.repository }}
           TESTED_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
@@ -62,3 +64,24 @@ jobs:
             --squash \
             --delete-branch \
             --match-head-commit "$TESTED_HEAD_SHA"
+
+          for attempt in {1..20}; do
+            pr_json="$(gh api "repos/$REPOSITORY/pulls/$PR_NUMBER")"
+            if [[ "$(jq -r '.merged' <<< "$pr_json")" == "true" ]]; then
+              gh api \
+                --method POST \
+                "repos/$REPOSITORY/actions/workflows/$CI_WORKFLOW_ID/dispatches" \
+                -f ref=main
+              exit 0
+            fi
+
+            if [[ "$(jq -r '.state' <<< "$pr_json")" == "closed" ]]; then
+              echo "::error::PR #$PR_NUMBER closed without merging."
+              exit 1
+            fi
+
+            sleep 15
+          done
+
+          echo "::error::PR #$PR_NUMBER did not merge within five minutes."
+          exit 1

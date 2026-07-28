@@ -1,0 +1,58 @@
+name: Auto-merge
+
+on:
+  workflow_run:
+    workflows:
+      - CI
+      - CI/CD
+    types:
+      - completed
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  merge:
+    name: Merge trusted PR
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.pull_requests[0] != null
+    runs-on: ubuntu-latest
+    steps:
+      - name: Approve Dependabot and merge
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+          REPOSITORY: ${{ github.repository }}
+          TESTED_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          TRUSTED_AUTHOR: alesgsanudoo
+        run: |
+          pr_json="$(gh api "repos/$REPOSITORY/pulls/$PR_NUMBER")"
+          author="$(jq -r '.user.login' <<< "$pr_json")"
+          base_branch="$(jq -r '.base.ref' <<< "$pr_json")"
+          draft="$(jq -r '.draft' <<< "$pr_json")"
+          state="$(jq -r '.state' <<< "$pr_json")"
+
+          if [[ "$author" != "$TRUSTED_AUTHOR" && "$author" != "dependabot[bot]" ]]; then
+            echo "::notice::Skipping PR #$PR_NUMBER from $author."
+            exit 0
+          fi
+
+          if [[ "$base_branch" != "main" || "$draft" == "true" || "$state" != "open" ]]; then
+            echo "::notice::Skipping PR #$PR_NUMBER because it is not an open, ready PR into main."
+            exit 0
+          fi
+
+          if [[ "$author" == "dependabot[bot]" ]]; then
+            gh pr review "$PR_NUMBER" --repo "$REPOSITORY" --approve ||
+              echo "::notice::Dependabot approval is disabled; repository rules will decide whether it can merge."
+          fi
+
+          gh pr merge "$PR_NUMBER" \
+            --repo "$REPOSITORY" \
+            --squash \
+            --delete-branch \
+            --match-head-commit "$TESTED_HEAD_SHA"

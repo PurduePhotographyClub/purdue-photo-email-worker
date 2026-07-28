@@ -51,8 +51,14 @@ jobs:
               echo "::notice::Dependabot approval is disabled; repository rules will decide whether it can merge."
           fi
 
+          merge_mode=()
+          if [[ "$(gh api "repos/$REPOSITORY" --jq '.allow_auto_merge')" == "true" ]]; then
+            merge_mode+=(--auto)
+          fi
+
           gh pr merge "$PR_NUMBER" \
             --repo "$REPOSITORY" \
+            "${merge_mode[@]}" \
             --squash \
             --delete-branch \
             --match-head-commit "$TESTED_HEAD_SHA"

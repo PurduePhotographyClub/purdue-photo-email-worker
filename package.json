@@ -18,7 +18,7 @@
     }
   },
   "dependencies": {
-    "postal-mime": "^2.6.0",
+    "postal-mime": "^2.7.5",
     "unpdf": "^1.6.2"
   },
   "devDependencies": {

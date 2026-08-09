@@ -18,12 +18,12 @@
     }
   },
   "dependencies": {
-    "postal-mime": "^2.7.5",
+    "postal-mime": "^2.7.6",
     "unpdf": "^1.8.0"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^5.20260730.1",
+    "@cloudflare/workers-types": "^5.20260809.1",
     "typescript": "^7.0.2",
-    "wrangler": "^4.115.0"
+    "wrangler": "^4.120.0"
   }
 }

@@ -19,11 +19,11 @@
   },
   "dependencies": {
     "postal-mime": "^3.0.0",
-    "unpdf": "^1.8.0"
+    "unpdf": "^1.8.1"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^5.20260813.1",
+    "@cloudflare/workers-types": "^5.20260820.1",
     "typescript": "^7.0.2",
-    "wrangler": "^4.122.0"
+    "wrangler": "^4.124.0"
   }
 }

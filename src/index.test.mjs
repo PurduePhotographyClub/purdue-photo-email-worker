@@ -497,6 +497,42 @@ test("parses a letter-only Purdue alias and separate membership and facilities l
   );
 });
 
+test("normalizes username and Purdue email customer IDs", () => {
+  for (const printedCustomerId of [
+    "sampleid",
+    "sampleid@purdue.edu",
+    "sampleid@purdu",
+  ]) {
+    const lines = createForwardedTooCoolPdfLines().map((line) =>
+      line === "sampleid" ? printedCustomerId : line
+    );
+    const receipt = parseTooCoolReceiptText(lines.join("\n"));
+    const payloads = buildReceiptPayloads(receipt);
+
+    assert.equal(receipt.customerId, "sampleid");
+    assert.equal(receipt.customerName, "Sample Purchaser");
+    assert.deepEqual(
+      payloads.map(({ customerEmail }) => customerEmail),
+      ["sampleid@purdue.edu", "sampleid@purdue.edu"],
+    );
+  }
+
+  for (const invalidCustomerId of [
+    "sampleid@example.com",
+    "sampleid@purdue",
+    "sampleid@purdu.edu",
+    "sampleid@purdue.edu@example.com",
+  ]) {
+    const invalidCustomerIdLines = createForwardedTooCoolPdfLines().map((line) =>
+      line === "sampleid" ? invalidCustomerId : line
+    );
+    assert.throws(
+      () => parseTooCoolReceiptText(invalidCustomerIdLines.join("\n")),
+      /Missing TooCOOL customer id/,
+    );
+  }
+});
+
 test("does not mistake a purchaser name for a missing column-ordered customer id", () => {
   const lines = createForwardedTooCoolPdfLines();
   const customerIdIndex = lines.indexOf("sampleid");

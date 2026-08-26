@@ -65,6 +65,8 @@ npm run dev
 
 Runtime secrets and Email Routing rules are managed outside this public repository. The dashboard must provide the single exact receipt sender; an empty, wildcard, or multi-address setting fails closed. The Worker fetches this policy for every email and may use a validated last-known-good KV copy for no more than 15 minutes only when the API is unreachable, rate limited, or returning a 5xx response. Authentication, route, and invalid-config responses always fail closed. Both configuration and fulfillment calls use the dedicated `EMAIL_WORKER_INTERNAL_TOKEN` secret; the shared API token is never accepted as a fallback.
 
+When BOSO sends a receipt to a treasurer who forwards it to the purchase mailbox, configure the treasurer's exact forwarding address as the receipt sender. Cloudflare sees the treasurer as the outer SMTP sender; the BOSO address in the quoted original message is not the envelope sender.
+
 ## Verification
 
 ```sh

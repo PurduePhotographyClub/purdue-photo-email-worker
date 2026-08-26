@@ -30,6 +30,39 @@ function createReceiptText(lineItem) {
   ].join("\n");
 }
 
+function createForwardedTooCoolPdfLines() {
+  return [
+    "Order",
+    "Page 1 of 1",
+    "Order:",
+    "Order Date:",
+    "Customer ID:",
+    "Ship To:",
+    "Quantity Description Color Size Unit Price Shipping Sales Tax Price",
+    "Thank you for using TooCOOL. Generated 8/25/2026 6:49:39 PM",
+    "Items",
+    "Shipping",
+    "Sales Tax",
+    "Total",
+    "155859",
+    "25 Aug 2026",
+    "sampleid",
+    "Sample Purchaser",
+    "Sample Purchaser",
+    "100 Example Ave.",
+    "West Lafayette, IN 47907",
+    "United States Of America",
+    "1 Membership Dues F26 10.00 0.00 0.00 10.00",
+    "(01760) PHOTOGRAPHY CLUB",
+    "1 Facilities Access F26 20.00 0.00 0.00 20.00",
+    "(01760) PHOTOGRAPHY CLUB",
+    "PAID 30.00",
+    "0.00",
+    "0.00",
+    "30.00",
+  ];
+}
+
 function createStackedReceiptText(quantity, description, moneyValues) {
   return [
     "Order: 12345",
@@ -150,15 +183,16 @@ function createPdfWithText(lines) {
 
 function createReceiptMimeEmail({
   fromHeader = "Trusted Sender <trusted.sender@example.com>",
-} = {}) {
-  const pdf = createPdfWithText([
+  pdfLines = [
     "Order: 12345",
     "Customer ID: jdoe42",
     "Jane Doe Order Date: 1 Jan 2026",
     "Quantity Description Price Discount Tax Total",
     "1 Membership 20.00 20.00 0.00 20.00",
     "PAID",
-  ]);
+  ],
+} = {}) {
+  const pdf = createPdfWithText(pdfLines);
   const boundary = "receipt-test-boundary";
   const fromHeaders = Array.isArray(fromHeader)
     ? fromHeader.map((value) => `From: ${value}`)
@@ -354,6 +388,39 @@ test("multi-quantity basic memberships use unit pricing and member-tier keys", (
   ]);
 });
 
+test("classifies print and film purchases while ignoring unsupported lines", () => {
+  const payloads = buildReceiptPayloads(parseTooCoolReceiptText([
+    "Order: 12345",
+    "Customer ID: jdoe42",
+    "Jane Doe Order Date: 1 Jan 2026",
+    "Quantity Description Price Discount Tax Total",
+    "1 Printing Credit 5.00 0.00 0.00 5.00",
+    "1 Film Processing 8.00 0.00 0.00 8.00",
+    "1 Club Donation 2.00 0.00 0.00 2.00",
+    "PAID",
+  ].join("\n")));
+
+  assert.deepEqual(
+    payloads.map(({ amount, kind, productName }) => ({
+      amount,
+      kind,
+      productName,
+    })),
+    [
+      {
+        amount: "$5.00",
+        kind: "prints",
+        productName: "Printing Credit",
+      },
+      {
+        amount: "$8.00",
+        kind: "rolls",
+        productName: "Film Processing",
+      },
+    ],
+  );
+});
+
 test("parses TooCOOL column-ordered text when footer copy precedes the item row", () => {
   const payloads = buildReceiptPayloads(parseTooCoolReceiptText([
     "Order",
@@ -396,6 +463,52 @@ test("parses TooCOOL column-ordered text when footer copy precedes the item row"
     purchasedAt: "2026-01-17T00:00:00.000Z",
     tier: "member",
   }]);
+});
+
+test("parses a letter-only Purdue alias and separate membership and facilities lines", () => {
+  const payloads = buildReceiptPayloads(parseTooCoolReceiptText(
+    createForwardedTooCoolPdfLines().join("\n"),
+  ));
+
+  assert.deepEqual(
+    payloads.map(({ amount, customerEmail, kind, productName, tier }) => ({
+      amount,
+      customerEmail,
+      kind,
+      productName,
+      tier,
+    })),
+    [
+      {
+        amount: "$10.00",
+        customerEmail: "sampleid@purdue.edu",
+        kind: "membership",
+        productName: "Membership Dues F26",
+        tier: "member",
+      },
+      {
+        amount: "$20.00",
+        customerEmail: "sampleid@purdue.edu",
+        kind: "membership",
+        productName: "Facilities Access F26",
+        tier: "facilities",
+      },
+    ],
+  );
+});
+
+test("does not mistake a purchaser name for a missing column-ordered customer id", () => {
+  const lines = createForwardedTooCoolPdfLines();
+  const customerIdIndex = lines.indexOf("sampleid");
+  const withoutCustomerId = [
+    ...lines.slice(0, customerIdIndex),
+    ...lines.slice(customerIdIndex + 1),
+  ];
+
+  assert.throws(
+    () => parseTooCoolReceiptText(withoutCustomerId.join("\n")),
+    /Missing TooCOOL customer id/,
+  );
 });
 
 test("rejects parsed receipt lines with an invalid quantity or total before classification", () => {
@@ -1044,6 +1157,142 @@ test("email ingress loads the dashboard sender config and forwards source metada
   assert.deepEqual(putOptions.get("receipt-ingress-config:v1"), {
     expirationTtl: 15 * 60,
   });
+});
+
+test("email ingress fulfills both items forwarded from BOSO by the configured treasurer", async () => {
+  const calls = [];
+  const { env } = createIngressEnv(async (input) => {
+    const request = input instanceof Request ? input : new Request(input);
+    const pathname = new URL(request.url).pathname;
+    calls.push({
+      body: request.method === "POST" ? await request.clone().json() : null,
+      method: request.method,
+      pathname,
+    });
+    if (pathname === "/internal/receipts/config") {
+      return Response.json({
+        settings: {
+          allowedSenderEmail: "treasurer@purdue.edu",
+          receiptToAddress: "purchases@purduephotoclub.org",
+        },
+      });
+    }
+    return Response.json({ success: true });
+  });
+  const raw = createReceiptMimeEmail({
+    fromHeader: "Club Treasurer <treasurer@purdue.edu>",
+    pdfLines: createForwardedTooCoolPdfLines(),
+  });
+  const { message, rejections } = createEmailMessage({
+    from: "treasurer@purdue.edu",
+    raw,
+  });
+
+  await runEmailHandler(message, env);
+
+  assert.deepEqual(rejections, []);
+  assert.deepEqual(
+    calls.map(({ method, pathname }) => `${method} ${pathname}`),
+    [
+      "GET /internal/receipts/config",
+      "POST /internal/receipts",
+      "POST /internal/receipts",
+    ],
+  );
+  assert.deepEqual(
+    calls.slice(1).map(({ body }) => ({
+      amount: body.amount,
+      customerEmail: body.customerEmail,
+      productName: body.productName,
+      sourceSender: body.sourceSender,
+      tier: body.tier,
+    })),
+    [
+      {
+        amount: "$10.00",
+        customerEmail: "sampleid@purdue.edu",
+        productName: "Membership Dues F26",
+        sourceSender: "treasurer@purdue.edu",
+        tier: "member",
+      },
+      {
+        amount: "$20.00",
+        customerEmail: "sampleid@purdue.edu",
+        productName: "Facilities Access F26",
+        sourceSender: "treasurer@purdue.edu",
+        tier: "facilities",
+      },
+    ],
+  );
+});
+
+test("email ingress rejects an unconfigured forwarder before reading MIME", async () => {
+  let rawRead = false;
+  const { env } = createIngressEnv(async (input) => {
+    const request = input instanceof Request ? input : new Request(input);
+    if (new URL(request.url).pathname === "/internal/receipts/config") {
+      return Response.json({
+        settings: {
+          allowedSenderEmail: "treasurer@purdue.edu",
+          receiptToAddress: "purchases@purduephotoclub.org",
+        },
+      });
+    }
+    throw new Error("Unauthorized email must not reach fulfillment.");
+  });
+  const rejections = [];
+  const message = {
+    from: "purchaser@purdue.edu",
+    headers: new Headers({ "message-id": "<unconfigured-forwarder@example.com>" }),
+    raw: {
+      getReader() {
+        rawRead = true;
+        throw new Error("Unauthorized email must not be parsed.");
+      },
+    },
+    rawSize: 1,
+    setReject(reason) {
+      rejections.push(reason);
+    },
+    to: "purchases@purduephotoclub.org",
+  };
+
+  await runEmailHandler(message, env);
+
+  assert.equal(rawRead, false);
+  assert.deepEqual(rejections, ["Unauthorized receipt sender."]);
+});
+
+test("email ingress requires the forwarded PDF attachment", async () => {
+  const { env } = createIngressEnv(async (input) => {
+    const request = input instanceof Request ? input : new Request(input);
+    if (new URL(request.url).pathname === "/internal/receipts/config") {
+      return Response.json({
+        settings: {
+          allowedSenderEmail: "treasurer@purdue.edu",
+          receiptToAddress: "purchases@purduephotoclub.org",
+        },
+      });
+    }
+    throw new Error("Email without a PDF must not reach fulfillment.");
+  });
+  const raw = Buffer.from([
+    "From: Club Treasurer <treasurer@purdue.edu>",
+    "To: purchases@purduephotoclub.org",
+    "Message-ID: <forward-without-pdf@example.com>",
+    "Subject: Fw: TooCOOL Order Confirmation",
+    "Content-Type: text/plain; charset=utf-8",
+    "",
+    "Forwarded BOSO receipt without its attachment.",
+  ].join("\r\n"));
+  const { message, rejections } = createEmailMessage({
+    from: "treasurer@purdue.edu",
+    raw,
+  });
+
+  await runEmailHandler(message, env);
+
+  assert.deepEqual(rejections, ["Receipt PDF attachment required."]);
 });
 
 test("email ingress requires one RFC 5322 From mailbox matching the envelope sender", async () => {

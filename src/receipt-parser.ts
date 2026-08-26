@@ -44,7 +44,7 @@ export function parseTooCoolReceiptText(text: string): TooCoolReceipt {
   const lines = splitNonEmptyLines(normalizedText);
 
   const orderId = readOrderId(normalizedText, lines);
-  const customerId = readCustomerId(normalizedText, lines).toLowerCase();
+  const customerId = readCustomerId(normalizedText, lines, orderId).toLowerCase();
   const customerName = readCustomerName(normalizedText, lines, customerId);
   const purchasedAt = readPurchasedAt(normalizedText);
   const lineItems = readLineItems(lines);
@@ -175,17 +175,24 @@ function readOrderId(text: string, lines: string[]) {
   return value;
 }
 
-function readCustomerId(text: string, lines: string[]) {
+function readCustomerId(text: string, lines: string[], orderId: string) {
   const inline = readInlineLabelValue(text, "Customer ID");
-  if (inline && /^[A-Za-z0-9._-]+$/.test(inline)) {
+  if (inline && isPurdueCustomerId(inline)) {
     return inline;
   }
 
-  const value = lines.find((line) => /^[A-Za-z]{2,}[A-Za-z0-9._-]*\d{2,}$/.test(line));
-  if (!value) {
+  const orderIdIndex = lines.findIndex((line) => line === orderId);
+  const orderDateIndex = lines.findIndex((line, index) =>
+    index > orderIdIndex && /^\d{1,2}\s+[A-Za-z]{3,}\s+\d{4}$/.test(line));
+  const value = lines[orderDateIndex + 1] ?? "";
+  if (orderDateIndex < 0 || !isPurdueCustomerId(value)) {
     throw new Error("Missing TooCOOL customer id.");
   }
   return value;
+}
+
+function isPurdueCustomerId(value: string) {
+  return /^[A-Za-z0-9._-]{2,40}$/.test(value);
 }
 
 function readInlineLabelValue(text: string, label: string) {
@@ -410,6 +417,9 @@ function classifyLineItem(
   unitPriceCents: number,
 ): { kind: ReceiptKind | null; tier: MembershipTier | null } {
   const normalized = description.toLowerCase();
+  if (/\bfacilit(?:y|ies)\b/.test(normalized)) {
+    return { kind: "membership", tier: "facilities" };
+  }
   if (/\b(member|membership|dues)\b/.test(normalized)) {
     return {
       kind: "membership",

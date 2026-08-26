@@ -176,23 +176,30 @@ function readOrderId(text: string, lines: string[]) {
 }
 
 function readCustomerId(text: string, lines: string[], orderId: string) {
-  const inline = readInlineLabelValue(text, "Customer ID");
-  if (inline && isPurdueCustomerId(inline)) {
+  const inline = normalizePurdueCustomerId(
+    readInlineLabelValue(text, "Customer ID") ?? "",
+  );
+  if (inline) {
     return inline;
   }
 
   const orderIdIndex = lines.findIndex((line) => line === orderId);
   const orderDateIndex = lines.findIndex((line, index) =>
     index > orderIdIndex && /^\d{1,2}\s+[A-Za-z]{3,}\s+\d{4}$/.test(line));
-  const value = lines[orderDateIndex + 1] ?? "";
-  if (orderDateIndex < 0 || !isPurdueCustomerId(value)) {
+  const value = normalizePurdueCustomerId(lines[orderDateIndex + 1] ?? "");
+  if (orderDateIndex < 0 || !value) {
     throw new Error("Missing TooCOOL customer id.");
   }
   return value;
 }
 
-function isPurdueCustomerId(value: string) {
-  return /^[A-Za-z0-9._-]{2,40}$/.test(value);
+function normalizePurdueCustomerId(value: string) {
+  const normalized = value.toLowerCase().trim();
+  const emailMatch = /^([a-z0-9._-]{2,40})@(?:purdue\.edu|purdu)$/.exec(normalized);
+  if (emailMatch?.[1]) {
+    return emailMatch[1];
+  }
+  return /^[a-z0-9._-]{2,40}$/.test(normalized) ? normalized : null;
 }
 
 function readInlineLabelValue(text: string, label: string) {
@@ -207,7 +214,9 @@ function readCustomerName(text: string, lines: string[], customerId: string) {
     return cleanName(inlineMatch[1]);
   }
 
-  const customerIdIndex = lines.findIndex((line) => line.toLowerCase() === customerId.toLowerCase());
+  const customerIdIndex = lines.findIndex((line) =>
+    normalizePurdueCustomerId(line) === customerId.toLowerCase()
+  );
   const stackedCandidate = customerIdIndex >= 0
     ? chooseStackedCustomerName(lines.slice(customerIdIndex + 1, customerIdIndex + 8))
     : "";
@@ -436,8 +445,8 @@ function classifyLineItem(
 }
 
 function toPurdueEmail(customerId: string) {
-  const normalized = customerId.toLowerCase().trim();
-  if (!/^[a-z0-9._-]{2,40}$/.test(normalized)) {
+  const normalized = normalizePurdueCustomerId(customerId);
+  if (!normalized) {
     return null;
   }
   return `${normalized}@${PURDUE_EMAIL_DOMAIN}`;

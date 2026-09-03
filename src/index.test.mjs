@@ -91,6 +91,20 @@ function createPayload(overrides = {}) {
   };
 }
 
+function createTooCoolEmailBody({
+  customerEmail = "jdoe42@purdue.edu",
+  orderId = "12345",
+} = {}) {
+  return [
+    "ATTENTION: TooCOOL Order Confirmation",
+    "Customer: Doe, Jane",
+    "Order Date: 1/1/2026",
+    "Shipping Name: Jane Doe",
+    `Order Number: ${orderId}`,
+    `Email: ${customerEmail}`,
+  ].join("\n");
+}
+
 function createTestEnv(fetchImpl, { handleConfig = true } = {}) {
   const stored = new Map();
   const putOptions = new Map();
@@ -183,9 +197,10 @@ function createPdfWithText(lines) {
 }
 
 function createReceiptMimeEmail({
-  body = "Email: jdoe42@purdue.edu",
+  body = createTooCoolEmailBody(),
   bodyContentType = "text/plain",
   fromHeader = "Trusted Sender <trusted.sender@example.com>",
+  pdfCopies = 1,
   pdfLines = [
     "Order: 12345",
     "Customer ID: jdoe42",
@@ -212,12 +227,14 @@ function createReceiptMimeEmail({
     `Content-Type: ${bodyContentType}; charset=utf-8`,
     "",
     body,
-    `--${boundary}`,
-    'Content-Type: application/pdf; name="receipt.pdf"',
-    'Content-Disposition: attachment; filename="receipt.pdf"',
-    "Content-Transfer-Encoding: base64",
-    "",
-    pdf.toString("base64"),
+    ...Array.from({ length: pdfCopies }, (_, index) => [
+      `--${boundary}`,
+      `Content-Type: application/pdf; name="receipt-${index + 1}.pdf"`,
+      `Content-Disposition: attachment; filename="receipt-${index + 1}.pdf"`,
+      "Content-Transfer-Encoding: base64",
+      "",
+      pdf.toString("base64"),
+    ]).flat(),
     `--${boundary}--`,
     "",
   ].join("\r\n"));
@@ -554,32 +571,40 @@ test("extracts the labeled customer email from the BOSO message body", () => {
     "From: BOSOFinance@Purdue.edu",
     "To: sahin3@purdue.edu; croteaud@purdue.edu",
     "Subject: TooCOOL Order Confirmation",
+    "ATTENTION: TooCOOL Order Confirmation",
     "Customer: Werling, Payton Porter",
+    "Order Date: 8/28/2026",
     "Shipping Name: Payton Werling",
+    "Order Number: 156565",
     "Email: werlingp@purdue.edu",
   ].join("\n");
   const forwardedHtml = [
     '<p>To: <a href="mailto:sahin3@purdue.edu">sahin3@purdue.edu</a>; ',
     '<a href="mailto:croteaud@purdue.edu">croteaud@purdue.edu</a></p>',
+    "<p>ATTENTION: TooCOOL Order Confirmation</p>",
     "<table>",
+    "<tr><th>Customer:</th><td>Werling, Payton Porter</td><th>Order Date:</th><td>8/28/2026</td></tr>",
+    "<tr><th>Shipping Name:</th><td>Payton Werling</td><th>Order Number:</th><td>156565</td></tr>",
     "<tr><th>Email:</th>",
     '<td><a href="mailto:werlingp@purdue.edu">WERLINGP@purdue.edu</a></td></tr>',
     "</table>",
   ].join("");
 
   assert.equal(
-    extractTooCoolCustomerEmail({ text: forwardedText }),
+    extractTooCoolCustomerEmail({ text: forwardedText }, "156565"),
     "werlingp@purdue.edu",
   );
   assert.equal(
-    extractTooCoolCustomerEmail({ html: forwardedHtml }),
+    extractTooCoolCustomerEmail({ html: forwardedHtml }, "156565"),
     "werlingp@purdue.edu",
   );
 });
 
 test("accepts non-Purdue customer emails and rejects unsafe ambiguity", () => {
   assert.equal(
-    extractTooCoolCustomerEmail({ text: "Email: customer@example.com" }),
+    extractTooCoolCustomerEmail({
+      text: createTooCoolEmailBody({ customerEmail: "customer@example.com" }),
+    }, "12345"),
     "customer@example.com",
   );
   assert.throws(
@@ -587,15 +612,51 @@ test("accepts non-Purdue customer emails and rejects unsafe ambiguity", () => {
     /Missing TooCOOL customer email/,
   );
   assert.throws(
-    () => extractTooCoolCustomerEmail({ text: "Email: not-an-email" }),
+    () => extractTooCoolCustomerEmail({
+      text: createTooCoolEmailBody({ customerEmail: "not-an-email" }),
+    }),
     /valid email address/,
   );
   assert.throws(
     () => extractTooCoolCustomerEmail({
-      html: "<p>Email: second@purdue.edu</p>",
-      text: "Email: first@purdue.edu",
+      html: `<p>${createTooCoolEmailBody({
+        customerEmail: "second@purdue.edu",
+      })}</p>`,
+      text: createTooCoolEmailBody({ customerEmail: "first@purdue.edu" }),
     }),
     /multiple customer emails/,
+  );
+  assert.throws(
+    () => extractTooCoolCustomerEmail({
+      text: createTooCoolEmailBody({ customerEmail: "buyer@example.com" }),
+    }, "99999"),
+    /matching TooCOOL order/,
+  );
+});
+
+test("does not use signature fields or content inside malformed html", () => {
+  const bodyWithoutCustomerEmail = [
+    "ATTENTION: TooCOOL Order Confirmation",
+    "Customer: Doe, Jane",
+    "Order Date: 1/1/2026",
+    "Shipping Name: Jane Doe",
+    "Order Number: 12345",
+    "Thank you for your order.",
+    "Treasurer signature",
+    "Email: treasurer@example.com",
+  ].join("\n");
+
+  assert.throws(
+    () => extractTooCoolCustomerEmail({ text: bodyWithoutCustomerEmail }, "12345"),
+    /Missing TooCOOL customer email/,
+  );
+  assert.throws(
+    () => extractTooCoolCustomerEmail({
+      html: `<script>${createTooCoolEmailBody({
+        customerEmail: "attacker@example.com",
+      })}`,
+    }, "12345"),
+    /Missing TooCOOL customer email/,
   );
 });
 
@@ -768,6 +829,7 @@ test("queues a receipt after transport failure and retries it durably", async ()
   const retryState = JSON.parse(
     stored.get(`receipt-retry:${payload.idempotencyKey}`),
   );
+  assert.equal(retryState.recipientSource, "email-body-v1");
   const retry = await retryQueuedReceiptPayloads(
     env,
     new Date(Date.parse(retryState.nextAttemptAt) + 1).toISOString(),
@@ -825,6 +887,7 @@ test("a fresh processing lease remains queued instead of being acknowledged as f
       attempts: 0,
       payload,
       processingStartedAt: new Date().toISOString(),
+      recipientSource: "email-body-v1",
       status: "processing",
     }),
   );
@@ -833,6 +896,44 @@ test("a fresh processing lease remains queued instead of being acknowledged as f
 
   assert.deepEqual(result, { duplicate: false, queued: true, status: 202 });
   assert.equal(apiCalls, 0);
+});
+
+test("scheduled retries dead-letter payloads created before body recipients", async () => {
+  let apiCalls = 0;
+  const { env, stored } = createTestEnv(async () => {
+    apiCalls += 1;
+    return Response.json({ success: true });
+  });
+  const legacyPayload = createPayload({
+    customerEmail: "aportiere@purdue.edu",
+    idempotencyKey: "toocool:156565:membership:membership-dues-f26:1000",
+    orderId: "156565",
+  });
+  const retryKey = `receipt-retry:${legacyPayload.idempotencyKey}`;
+  stored.set(retryKey, JSON.stringify({
+    attempts: 1,
+    nextAttemptAt: "2026-09-03T12:00:00.000Z",
+    payload: legacyPayload,
+    status: "retry",
+  }));
+
+  const result = await retryQueuedReceiptPayloads(
+    env,
+    "2026-09-03T12:00:00.001Z",
+  );
+
+  assert.equal(apiCalls, 0);
+  assert.deepEqual(result, {
+    failed: 1,
+    retried: 0,
+    scanned: 1,
+    succeeded: 0,
+  });
+  assert.equal(stored.has(retryKey), false);
+  const failed = JSON.parse(stored.get(
+    `receipt-failed:${legacyPayload.idempotencyKey}`,
+  ));
+  assert.match(failed.error, /body recipient selection/);
 });
 
 test("permanent API failures move to a dead-letter prefix outside the retry scan", async () => {
@@ -972,6 +1073,7 @@ test("scheduled retries load sender policy once and dead-letter revoked or missi
       attempts: 1,
       nextAttemptAt: "2026-07-24T12:00:00.000Z",
       payload,
+      recipientSource: "email-body-v1",
       status: "retry",
     }));
   }
@@ -1076,6 +1178,7 @@ test("scheduled retries leave the queue untouched when sender policy cannot be r
     attempts: 1,
     nextAttemptAt: "2026-07-24T12:00:00.000Z",
     payload,
+    recipientSource: "email-body-v1",
     status: "retry",
   };
   stored.set(retryKey, JSON.stringify(retryRecord));
@@ -1292,7 +1395,9 @@ test("email ingress fulfills both items forwarded from BOSO by the configured tr
       "Purdue University W. Lafayette",
       "ATTENTION: TooCOOL Order Confirmation",
       "Customer: Werling, Payton Porter",
+      "Order Date: 8/25/2026",
       "Shipping Name: Payton Werling",
+      "Order Number: 155859",
       "Email: werlingp@purdue.edu",
     ].join("\n"),
     fromHeader: "Club Treasurer <treasurer@purdue.edu>",
@@ -1365,8 +1470,8 @@ test("email ingress reads the labeled customer email from an html BOSO body", as
       '<p>To: <a href="mailto:sahin3@purdue.edu">sahin3@purdue.edu</a>; ',
       '<a href="mailto:croteaud@purdue.edu">croteaud@purdue.edu</a></p>',
       "<table>",
-      "<tr><th>Customer:</th><td>Sample, Trent</td></tr>",
-      "<tr><th>Shipping Name:</th><td>Trent Sample</td></tr>",
+      "<tr><th>Customer:</th><td>Sample, Trent</td><th>Order Date:</th><td>8/25/2026</td></tr>",
+      "<tr><th>Shipping Name:</th><td>Trent Sample</td><th>Order Number:</th><td>155859</td></tr>",
       '<tr><th>Email:</th><td><a href="mailto:samplet@gmail.com">samplet@gmail.com</a></td></tr>',
       "</table>",
     ].join(""),
@@ -1396,8 +1501,11 @@ test("email ingress reads the labeled customer email from an html BOSO body", as
 test("email ingress never falls back to the PDF customer id", async () => {
   for (const body of [
     "Receipt attached.",
-    "Email: not-an-email",
-    "Email: first@example.com\nEmail: second@example.com",
+    createTooCoolEmailBody({ customerEmail: "not-an-email", orderId: "155859" }),
+    [
+      createTooCoolEmailBody({ customerEmail: "first@example.com", orderId: "155859" }),
+      createTooCoolEmailBody({ customerEmail: "second@example.com", orderId: "155859" }),
+    ].join("\n"),
   ]) {
     let fulfillmentCalls = 0;
     const { env } = createIngressEnv(async (input) => {
@@ -1430,6 +1538,38 @@ test("email ingress never falls back to the PDF customer id", async () => {
     assert.equal(fulfillmentCalls, 0);
     assert.deepEqual(rejections, ["Receipt processing failed."]);
   }
+});
+
+test("email ingress rejects multiple receipt PDFs before fulfillment", async () => {
+  let fulfillmentCalls = 0;
+  const { env } = createIngressEnv(async (input) => {
+    const request = input instanceof Request ? input : new Request(input);
+    if (new URL(request.url).pathname === "/internal/receipts/config") {
+      return Response.json({
+        settings: {
+          allowedSenderEmail: "treasurer@purdue.edu",
+          receiptToAddress: "purchases@purduephotoclub.org",
+        },
+      });
+    }
+    fulfillmentCalls += 1;
+    return Response.json({ success: true });
+  });
+  const raw = createReceiptMimeEmail({
+    body: createTooCoolEmailBody({ orderId: "155859" }),
+    fromHeader: "Club Treasurer <treasurer@purdue.edu>",
+    pdfCopies: 2,
+    pdfLines: createForwardedTooCoolPdfLines(),
+  });
+  const { message, rejections } = createEmailMessage({
+    from: "treasurer@purdue.edu",
+    raw,
+  });
+
+  await runEmailHandler(message, env);
+
+  assert.equal(fulfillmentCalls, 0);
+  assert.deepEqual(rejections, ["Only one receipt PDF attachment is supported."]);
 });
 
 test("email ingress rejects an unconfigured forwarder before reading MIME", async () => {

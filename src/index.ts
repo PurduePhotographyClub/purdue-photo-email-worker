@@ -31,8 +31,9 @@ const RECEIPT_RETRY_MAX_ATTEMPTS = 5;
 const MAX_RAW_EMAIL_BYTES = 10 * 1024 * 1024;
 const MAX_PDF_BYTES = 4 * 1024 * 1024;
 const MAX_FULFILLMENT_PAYLOADS_PER_EMAIL = 50;
-const MAX_RECEIPT_PDF_ATTACHMENTS = 4;
+const MAX_RECEIPT_PDF_ATTACHMENTS = 1;
 const RATE_LIMIT_RETRY_SECONDS = 60;
+const RECEIPT_RECIPIENT_SOURCE = "email-body-v1";
 
 export interface ReceiptProcessResult {
   duplicate: boolean;
@@ -47,6 +48,7 @@ interface ReceiptQueueRecord {
   payload?: ReceiptPayload;
   payloadFingerprint?: string;
   processingStartedAt?: string;
+  recipientSource?: typeof RECEIPT_RECIPIENT_SOURCE;
   status: "failed" | "fulfilled" | "processing" | "retry";
 }
 
@@ -116,9 +118,18 @@ export async function processReceiptPayload(
     return { duplicate: true, status: 200 };
   }
 
-  const existing = readReceiptQueueRecord(
+  let existing = readReceiptQueueRecord(
     await env.RECEIPT_DEDUPE.get(retryKey),
   );
+  if (existing?.payload && existing.recipientSource !== RECEIPT_RECIPIENT_SOURCE) {
+    await deadLetterQueuedReceipt(
+      env,
+      retryKey,
+      existing,
+      "Queued receipt predates email body recipient selection.",
+    );
+    existing = null;
+  }
   if (
     existing?.payload &&
     !areReceiptPayloadsEqual(existing.payload, payload)
@@ -320,12 +331,23 @@ export async function retryQueuedReceiptPayloads(
       if (!record?.payload || !ingressConfig) {
         continue;
       }
-      if (record.payload.sourceSender !== ingressConfig.allowedSenderEmail) {
+      if (record.recipientSource !== RECEIPT_RECIPIENT_SOURCE) {
         failed += 1;
-        await deadLetterQueuedReceiptForSender(
+        await deadLetterQueuedReceipt(
           env,
           key.name,
           record,
+          "Queued receipt predates email body recipient selection.",
+        );
+        continue;
+      }
+      if (record.payload.sourceSender !== ingressConfig.allowedSenderEmail) {
+        failed += 1;
+        await deadLetterQueuedReceipt(
+          env,
+          key.name,
+          record,
+          "Queued receipt sender is missing or no longer authorized.",
         );
         continue;
       }
@@ -407,10 +429,9 @@ async function handleReceiptEmail(
     return;
   }
   if (pdfAttachments.length > MAX_RECEIPT_PDF_ATTACHMENTS) {
-    message.setReject("Too many receipt PDF attachments.");
+    message.setReject("Only one receipt PDF attachment is supported.");
     return;
   }
-  const customerEmail = extractTooCoolCustomerEmail(parsedEmail);
 
   const sourceMessageId = normalizeSourceMessageId(
     message.headers.get("message-id"),
@@ -419,7 +440,7 @@ async function handleReceiptEmail(
     pdfAttachments.map(async (attachment) => {
       const payloads = await readReceiptAttachmentPayloads(
         attachment,
-        customerEmail,
+        parsedEmail,
       );
       return payloads.map((payload) => ({
         ...payload,
@@ -437,7 +458,7 @@ async function handleReceiptEmail(
 
 async function readReceiptAttachmentPayloads(
   attachment: AttachmentLike,
-  customerEmail: string,
+  parsedEmail: ParsedEmail,
 ) {
   const pdfBytes = readAttachmentBytes(attachment);
   if (pdfBytes.byteLength > MAX_PDF_BYTES) {
@@ -445,7 +466,12 @@ async function readReceiptAttachmentPayloads(
   }
 
   const text = await extractPdfText(pdfBytes);
-  return buildReceiptPayloads(parseTooCoolReceiptText(text), customerEmail);
+  const receipt = parseTooCoolReceiptText(text);
+  const customerEmail = extractTooCoolCustomerEmail(
+    parsedEmail,
+    receipt.orderId,
+  );
+  return buildReceiptPayloads(receipt, customerEmail);
 }
 
 async function parseMime(rawEmail: ArrayBuffer): Promise<ParsedEmail> {
@@ -714,7 +740,10 @@ async function putReceiptQueueRecord(
   key: string,
   record: ReceiptQueueRecord,
 ) {
-  await env.RECEIPT_DEDUPE.put(key, JSON.stringify(record), {
+  const storedRecord = record.payload
+    ? { ...record, recipientSource: RECEIPT_RECIPIENT_SOURCE }
+    : record;
+  await env.RECEIPT_DEDUPE.put(key, JSON.stringify(storedRecord), {
     expirationTtl: readRetryTtl(env),
   });
 }
@@ -775,10 +804,11 @@ async function queueReceiptRetry(
   });
 }
 
-async function deadLetterQueuedReceiptForSender(
+async function deadLetterQueuedReceipt(
   env: Env,
   retryKey: string,
   record: ReceiptQueueRecord,
+  error: string,
 ) {
   if (!record.payload) {
     return;
@@ -789,13 +819,14 @@ async function deadLetterQueuedReceiptForSender(
     ?? await createReceiptPayloadFingerprint(record.payload);
   await putReceiptQueueRecord(env, failedKey, {
     attempts: Math.max(0, record.attempts),
-    error: "Queued receipt sender is missing or no longer authorized.",
+    error,
     payload: record.payload,
     payloadFingerprint,
     status: "failed",
   });
   await env.RECEIPT_DEDUPE.delete(retryKey);
-  console.error("Queued receipt was dead-lettered after sender policy changed.", {
+  console.error("Queued receipt was dead-lettered.", {
+    error,
     idempotencyKey: record.payload.idempotencyKey,
   });
 }
@@ -836,6 +867,9 @@ function readReceiptQueueRecord(value: string | null): ReceiptQueueRecord | null
         : {}),
       ...(typeof parsed.processingStartedAt === "string"
         ? { processingStartedAt: parsed.processingStartedAt }
+        : {}),
+      ...(parsed.recipientSource === RECEIPT_RECIPIENT_SOURCE
+        ? { recipientSource: RECEIPT_RECIPIENT_SOURCE }
         : {}),
       status: parsed.status,
     };

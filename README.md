@@ -12,7 +12,7 @@ Cloudflare Email Routing Worker that turns purchase receipt emails into private 
 
 ## What It Does
 
-The Email Worker receives routed receipt emails, validates the sender, reads the customer's labeled `Email:` value from the BOSO message body, parses TooCOOL PDF invoices, deduplicates each order line, and forwards fulfillment payloads to the private API Worker.
+The Email Worker receives routed receipt emails, validates the sender, reads the customer's labeled `Email:` value from the matching BOSO order block, parses one TooCOOL PDF invoice, deduplicates each order line, and forwards fulfillment payloads to the private API Worker.
 
 ## Flow
 
@@ -90,7 +90,9 @@ wrangler.toml                Worker metadata and non-secret bindings
 
 - Reject unexpected recipients before parsing.
 - Require the envelope sender and the single parsed RFC 5322 `From` mailbox to match the configured sender exactly.
-- Use the single labeled `Email:` value in the message body for fulfillment; reject missing, malformed, or conflicting values instead of deriving an address from the PDF customer ID.
+- Use the single labeled `Email:` value in the matching BOSO order block for fulfillment; reject missing, malformed, or conflicting values instead of deriving an address from the PDF customer ID.
+- Accept exactly one receipt PDF per email so one customer's address cannot be applied to another attachment.
+- Dead-letter queued receipts created before body-based recipient selection rather than retrying their old PDF-derived addresses.
 - Limit raw email and PDF sizes to protect Worker memory.
 - Parse only supported TooCOOL receipt lines.
 - Keep fulfillment idempotent across both KV and the API database.

@@ -2,7 +2,9 @@ const MAX_MEMBERSHIP_UNITS_PER_LINE = 25;
 const MAX_SUPPORTED_RECEIPT_LINES = 50;
 const MAX_FULFILLMENT_PAYLOADS_PER_ATTACHMENT = 50;
 const MAX_CUSTOMER_EMAIL_LENGTH = 254;
+const MAX_RECEIPT_BODY_CHARS = 256 * 1024;
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const TOOCOOL_CONFIRMATION_LABEL = "attention: toocool order confirmation";
 
 type ReceiptKind = "membership" | "rolls" | "prints";
 type MembershipTier = "member" | "facilities";
@@ -45,6 +47,11 @@ interface TooCoolEmailContent {
   text?: string;
 }
 
+interface TooCoolEmailRecord {
+  customerEmail: string;
+  orderId: string;
+}
+
 export function parseTooCoolReceiptText(text: string): TooCoolReceipt {
   const normalizedText = normalizePdfText(text);
   const lines = splitNonEmptyLines(normalizedText);
@@ -70,17 +77,28 @@ export function parseTooCoolReceiptText(text: string): TooCoolReceipt {
 
 export function extractTooCoolCustomerEmail(
   content: TooCoolEmailContent,
+  expectedOrderId?: string,
 ): string {
   const bodies = [
     content.text,
     content.html ? readableHtmlText(content.html) : undefined,
   ].filter((body): body is string => typeof body === "string" && body.length > 0);
-  const candidates = bodies.flatMap(readLabeledCustomerEmails);
-  if (candidates.length === 0) {
+  const records = bodies.flatMap(readTooCoolEmailRecords);
+  if (records.length === 0) {
     throw new Error("Missing TooCOOL customer email in message body.");
   }
+  const matchingRecords = expectedOrderId
+    ? records.filter((record) => record.orderId === expectedOrderId)
+    : records;
+  if (matchingRecords.length === 0) {
+    throw new Error(
+      "Message body does not contain a customer email for the matching TooCOOL order.",
+    );
+  }
 
-  const normalized = candidates.map(normalizeCustomerEmail);
+  const normalized = matchingRecords.map((record) =>
+    normalizeCustomerEmail(record.customerEmail)
+  );
   if (normalized.some((candidate) => candidate === null)) {
     throw new Error("TooCOOL customer email must be a valid email address.");
   }
@@ -187,10 +205,39 @@ function normalizePdfText(text: string) {
 }
 
 function readableHtmlText(html: string) {
-  return html
-    .replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, " ")
-    .replace(/<style\b[^>]*>[\s\S]*?<\/style\s*>/gi, " ")
-    .replace(/<[^>]*>/g, " ")
+  assertReceiptBodySize(html);
+  const lowerHtml = html.toLowerCase();
+  const text: string[] = [];
+  let cursor = 0;
+  while (cursor < html.length) {
+    const tagStart = html.indexOf("<", cursor);
+    if (tagStart < 0) {
+      text.push(html.slice(cursor));
+      break;
+    }
+    text.push(html.slice(cursor, tagStart), " ");
+    const tagEnd = html.indexOf(">", tagStart + 1);
+    if (tagEnd < 0) {
+      break;
+    }
+
+    const tagName = /^\/?\s*([a-z0-9]+)/i.exec(
+      html.slice(tagStart + 1, tagEnd),
+    )?.[1]?.toLowerCase();
+    const isClosingTag = /^\s*\//.test(html.slice(tagStart + 1, tagEnd));
+    if (!isClosingTag && (tagName === "script" || tagName === "style")) {
+      const closingStart = lowerHtml.indexOf(`</${tagName}`, tagEnd + 1);
+      if (closingStart < 0) {
+        break;
+      }
+      const closingEnd = html.indexOf(">", closingStart + tagName.length + 2);
+      cursor = closingEnd < 0 ? html.length : closingEnd + 1;
+      continue;
+    }
+    cursor = tagEnd + 1;
+  }
+
+  return text.join("")
     .replace(/&#(?:0*64|x0*40);/gi, "@")
     .replace(/&commat;/gi, "@")
     .replace(/&period;/gi, ".")
@@ -198,13 +245,78 @@ function readableHtmlText(html: string) {
     .replace(/&amp;/gi, "&");
 }
 
-function readLabeledCustomerEmails(body: string) {
-  const candidates: string[] = [];
-  const pattern = /\bEmail\s*:\s*([^\s<>"']{1,300})/gi;
-  for (const match of body.matchAll(pattern)) {
-    candidates.push(match[1]);
+function readTooCoolEmailRecords(body: string): TooCoolEmailRecord[] {
+  assertReceiptBodySize(body);
+  const normalized = body.replace(/\s+/g, " ").trim();
+  const searchable = normalized.toLowerCase();
+  const records: TooCoolEmailRecord[] = [];
+  let cursor = 0;
+  while (cursor < normalized.length) {
+    const confirmationIndex = searchable.indexOf(
+      TOOCOOL_CONFIRMATION_LABEL,
+      cursor,
+    );
+    if (confirmationIndex < 0) {
+      break;
+    }
+    const nextConfirmationIndex = searchable.indexOf(
+      TOOCOOL_CONFIRMATION_LABEL,
+      confirmationIndex + TOOCOOL_CONFIRMATION_LABEL.length,
+    );
+    const blockEnd = nextConfirmationIndex < 0
+      ? normalized.length
+      : nextConfirmationIndex;
+    const record = readTooCoolEmailRecord(
+      normalized.slice(confirmationIndex, blockEnd),
+    );
+    if (record) {
+      records.push(record);
+    }
+    cursor = confirmationIndex + TOOCOOL_CONFIRMATION_LABEL.length;
   }
-  return candidates;
+  return records;
+}
+
+function readTooCoolEmailRecord(block: string): TooCoolEmailRecord | null {
+  const searchable = block.toLowerCase();
+  const customerIndex = searchable.indexOf("customer:");
+  const orderDateIndex = searchable.indexOf("order date:", customerIndex + 9);
+  const shippingIndex = searchable.indexOf("shipping name:", orderDateIndex + 11);
+  const orderNumberIndex = searchable.indexOf("order number:", shippingIndex + 14);
+  const emailIndex = searchable.indexOf("email:", orderNumberIndex + 13);
+  if (
+    customerIndex < 0 ||
+    orderDateIndex < 0 ||
+    shippingIndex < 0 ||
+    orderNumberIndex < 0 ||
+    emailIndex < 0
+  ) {
+    return null;
+  }
+
+  const customerName = block.slice(customerIndex + 9, orderDateIndex).trim();
+  const orderDate = block.slice(orderDateIndex + 11, shippingIndex).trim();
+  const shippingName = block.slice(shippingIndex + 14, orderNumberIndex).trim();
+  const orderId = block.slice(orderNumberIndex + 13, emailIndex).trim();
+  if (
+    customerName.length === 0 || customerName.length > 200 ||
+    orderDate.length === 0 || orderDate.length > 80 ||
+    shippingName.length === 0 || shippingName.length > 200 ||
+    !/^\d{4,}$/.test(orderId)
+  ) {
+    return null;
+  }
+
+  const customerEmail = /^\s*([^\s<>"']{1,300})/.exec(
+    block.slice(emailIndex + 6),
+  )?.[1];
+  return customerEmail ? { customerEmail, orderId } : null;
+}
+
+function assertReceiptBodySize(body: string) {
+  if (body.length > MAX_RECEIPT_BODY_CHARS) {
+    throw new Error("TooCOOL message body is too large.");
+  }
 }
 
 function normalizeCustomerEmail(value: string | undefined) {

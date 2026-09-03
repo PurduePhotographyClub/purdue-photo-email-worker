@@ -1,7 +1,8 @@
 const MAX_MEMBERSHIP_UNITS_PER_LINE = 25;
 const MAX_SUPPORTED_RECEIPT_LINES = 50;
 const MAX_FULFILLMENT_PAYLOADS_PER_ATTACHMENT = 50;
-const PURDUE_EMAIL_DOMAIN = "purdue.edu";
+const MAX_CUSTOMER_EMAIL_LENGTH = 254;
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 type ReceiptKind = "membership" | "rolls" | "prints";
 type MembershipTier = "member" | "facilities";
@@ -39,6 +40,11 @@ export interface ReceiptPayload {
   tier?: MembershipTier;
 }
 
+interface TooCoolEmailContent {
+  html?: string;
+  text?: string;
+}
+
 export function parseTooCoolReceiptText(text: string): TooCoolReceipt {
   const normalizedText = normalizePdfText(text);
   const lines = splitNonEmptyLines(normalizedText);
@@ -62,10 +68,39 @@ export function parseTooCoolReceiptText(text: string): TooCoolReceipt {
   };
 }
 
-export function buildReceiptPayloads(receipt: TooCoolReceipt): ReceiptPayload[] {
-  const customerEmail = toPurdueEmail(receipt.customerId);
+export function extractTooCoolCustomerEmail(
+  content: TooCoolEmailContent,
+): string {
+  const bodies = [
+    content.text,
+    content.html ? readableHtmlText(content.html) : undefined,
+  ].filter((body): body is string => typeof body === "string" && body.length > 0);
+  const candidates = bodies.flatMap(readLabeledCustomerEmails);
+  if (candidates.length === 0) {
+    throw new Error("Missing TooCOOL customer email in message body.");
+  }
+
+  const normalized = candidates.map(normalizeCustomerEmail);
+  if (normalized.some((candidate) => candidate === null)) {
+    throw new Error("TooCOOL customer email must be a valid email address.");
+  }
+
+  const unique = [...new Set(normalized.filter((candidate): candidate is string =>
+    candidate !== null
+  ))];
+  if (unique.length !== 1) {
+    throw new Error("TooCOOL message body contains multiple customer emails.");
+  }
+  return unique[0];
+}
+
+export function buildReceiptPayloads(
+  receipt: TooCoolReceipt,
+  customerEmailValue: string,
+): ReceiptPayload[] {
+  const customerEmail = normalizeCustomerEmail(customerEmailValue);
   if (!customerEmail) {
-    throw new Error("TooCOOL customer id cannot be converted to a Purdue email address.");
+    throw new Error("TooCOOL customer email must be a valid email address.");
   }
 
   const initial: {
@@ -149,6 +184,42 @@ function normalizePdfText(text: string) {
     .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "")
     .replace(/[ \t]+/g, " ")
     .trim();
+}
+
+function readableHtmlText(html: string) {
+  return html
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, " ")
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style\s*>/gi, " ")
+    .replace(/<[^>]*>/g, " ")
+    .replace(/&#(?:0*64|x0*40);/gi, "@")
+    .replace(/&commat;/gi, "@")
+    .replace(/&period;/gi, ".")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&");
+}
+
+function readLabeledCustomerEmails(body: string) {
+  const candidates: string[] = [];
+  const pattern = /\bEmail\s*:\s*([^\s<>"']{1,300})/gi;
+  for (const match of body.matchAll(pattern)) {
+    candidates.push(match[1]);
+  }
+  return candidates;
+}
+
+function normalizeCustomerEmail(value: string | undefined) {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const normalized = value.trim().toLowerCase();
+  if (
+    normalized.length === 0 ||
+    normalized.length > MAX_CUSTOMER_EMAIL_LENGTH ||
+    !EMAIL_PATTERN.test(normalized)
+  ) {
+    return null;
+  }
+  return normalized;
 }
 
 function splitNonEmptyLines(text: string) {
@@ -442,14 +513,6 @@ function classifyLineItem(
     return { kind: "rolls", tier: null };
   }
   return { kind: null, tier: null };
-}
-
-function toPurdueEmail(customerId: string) {
-  const normalized = normalizePurdueCustomerId(customerId);
-  if (!normalized) {
-    return null;
-  }
-  return `${normalized}@${PURDUE_EMAIL_DOMAIN}`;
 }
 
 function createIdempotencyKey(orderId: string, item: TooCoolLineItem) {

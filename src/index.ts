@@ -1,7 +1,15 @@
-import { buildReceiptPayloads, parseTooCoolReceiptText } from "./receipt-parser.ts";
+import {
+  buildReceiptPayloads,
+  extractTooCoolCustomerEmail,
+  parseTooCoolReceiptText,
+} from "./receipt-parser.ts";
 import type { ReceiptPayload } from "./receipt-parser.ts";
 import type { Address, Email as ParsedEmail } from "postal-mime";
-export { buildReceiptPayloads, parseTooCoolReceiptText } from "./receipt-parser.ts";
+export {
+  buildReceiptPayloads,
+  extractTooCoolCustomerEmail,
+  parseTooCoolReceiptText,
+} from "./receipt-parser.ts";
 export type { ReceiptPayload, TooCoolReceipt } from "./receipt-parser.ts";
 
 const INTERNAL_SOURCE_HEADER = "x-pcc-internal-source";
@@ -402,13 +410,17 @@ async function handleReceiptEmail(
     message.setReject("Too many receipt PDF attachments.");
     return;
   }
+  const customerEmail = extractTooCoolCustomerEmail(parsedEmail);
 
   const sourceMessageId = normalizeSourceMessageId(
     message.headers.get("message-id"),
   );
   const payloadGroups = await Promise.all(
     pdfAttachments.map(async (attachment) => {
-      const payloads = await readReceiptAttachmentPayloads(attachment);
+      const payloads = await readReceiptAttachmentPayloads(
+        attachment,
+        customerEmail,
+      );
       return payloads.map((payload) => ({
         ...payload,
         ...(sourceMessageId ? { sourceMessageId } : {}),
@@ -423,14 +435,17 @@ async function handleReceiptEmail(
   }
 }
 
-async function readReceiptAttachmentPayloads(attachment: AttachmentLike) {
+async function readReceiptAttachmentPayloads(
+  attachment: AttachmentLike,
+  customerEmail: string,
+) {
   const pdfBytes = readAttachmentBytes(attachment);
   if (pdfBytes.byteLength > MAX_PDF_BYTES) {
     throw new Error("Receipt PDF is too large.");
   }
 
   const text = await extractPdfText(pdfBytes);
-  return buildReceiptPayloads(parseTooCoolReceiptText(text));
+  return buildReceiptPayloads(parseTooCoolReceiptText(text), customerEmail);
 }
 
 async function parseMime(rawEmail: ArrayBuffer): Promise<ParsedEmail> {

@@ -18,15 +18,16 @@
     }
   },
   "dependencies": {
-    "postal-mime": "^4.0.6",
-    "unpdf": "^1.8.1"
+    "postal-mime": "^4.1.4",
+    "unpdf": "^1.9.1"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^5.20261015.1",
+    "@cloudflare/workers-types": "^5.20261025.1",
     "typescript": "^7.0.2",
-    "wrangler": "^4.151.0"
+    "wrangler": "^4.152.0"
   },
   "overrides": {
-    "sharp": "0.35.5"
+    "sharp": "0.35.5",
+    "undici@^7.0.0": "7.30.1"
   }
 }

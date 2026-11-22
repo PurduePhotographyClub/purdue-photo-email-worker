@@ -19,12 +19,12 @@
   },
   "dependencies": {
     "postal-mime": "^4.2.1",
-    "unpdf": "^2.1.0"
+    "unpdf": "^2.2.1"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^5.20261112.1",
+    "@cloudflare/workers-types": "^5.20261119.1",
     "typescript": "^7.0.2",
-    "wrangler": "^4.160.1"
+    "wrangler": "^4.165.0"
   },
   "overrides": {
     "sharp": "0.35.5",
